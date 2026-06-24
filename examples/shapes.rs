@@ -50,6 +50,9 @@ struct Demo {
     player: Vec2D,
     mouse: Vec2D,
     rainbow: Shader,
+    cow: Texture,
+    spin: f32,
+    zoom: f32,
 }
 
 impl Game for Demo {
@@ -58,16 +61,22 @@ impl Game for Demo {
             x: 100.0, dir: 1.0,
             player: Vec2D{ x: 0.0, y: 0.0 },
             mouse: Vec2D::ZERO,
+
             // Compile the custom shader once, up front (raylib's LoadShader).
             rainbow: ctx.load_shader_from_memory(RAINBOW_SHADER),
+
+            // Load the texture once. `include_bytes!` embeds the PNG (works for
+            // `cargo run`, `--example`, and the web build); the engine decodes
+            // and uploads it
+            cow: ctx.load_texture_from_memory(include_bytes!("assets/vaca.png")),
+            spin: 0.0,
+            zoom: 1.0,
         }
     }
 
     fn update(&mut self, ctx: &mut Context) {
         // Track the cursor in virtual-canvas coordinates.
         self.mouse = ctx.mouse_position();
-
-        println!("{}", ctx.dt);
 
         // Press F to toggle fullscreen, Esc to quit.
         if ctx.is_key_pressed(Key::F) {
@@ -91,6 +100,12 @@ impl Game for Demo {
             self.player.x += 5.0;
         }
 
+        // Spin the rotating cow at 90 deg/sec.
+        self.spin += 90.0 * ctx.dt;
+
+        // Mouse wheel zooms the camera in/out (clamped).
+        self.zoom = (self.zoom + ctx.mouse_wheel_move() * 0.1).clamp(0.1, 4.0);
+
         // Fixed-timestep movement: 240 virtual px/sec, bouncing in [100, 1080].
         self.x += self.dir * 240.0 * ctx.dt;
         if self.x > 1080.0 {
@@ -104,6 +119,17 @@ impl Game for Demo {
 
     fn draw(&mut self, canvas: &mut Canvas) {
         canvas.clear_background(WHITE);
+
+        // View the whole scene through a 2D camera that follows the player
+        // (its center pinned to the screen center) and zooms with the wheel.
+        // Everything until end_mode_2d is drawn in world space.
+        let camera = Camera2D {
+            target: self.player + Vec2D::new(50.0, 50.0),
+            offset: Vec2D::new(640.0, 360.0),
+            rotation: 0.0,
+            zoom: self.zoom,
+        };
+        canvas.begin_mode_2d(camera);
 
         // Static rectangle.
         canvas.rectangle(60.0, 60.0, 300.0, 180.0, SKYBLUE);
@@ -146,20 +172,42 @@ impl Game for Demo {
         canvas.circle(Vec2D::new(960.0, 480.0), 70.0, PURPLE);
         canvas.regular_polygon(Vec2D::new(1140.0, 480.0), 5, 70.0, -90.0, ORANGE);
 
-        // A thick line from the canvas center to the mouse cursor.
-        canvas.line(Vec2D::new(640.0, 360.0), self.mouse, 5.0, DARKBLUE);
+        canvas.draw_texture_ex(&self.cow, Vec2D::new(520.0, 230.0), 180.0, 6.0, WHITE);
+
+        // The same texture via DrawTexturePro: scaled 4x and spun about its
+        // center, which is placed at (1180, 600). A red tint is applied.
+        let size = self.cow.width() as f32 * 4.0;
+        canvas.draw_texture_pro(
+            &self.cow,
+            Rect::new(0.0, 0.0, self.cow.width() as f32, self.cow.height() as f32),
+            Rect::new(1180.0, 600.0, size, size),
+            Vec2D::new(size / 2.0, size / 2.0),
+            self.spin,
+            RED,
+        );
+
+        // A thick line from the canvas center to the mouse cursor. We're inside
+        // camera mode, so convert these screen-space points to world space —
+        // the camera maps them back to the exact same screen positions, keeping
+        // the line pinned to the center and the cursor regardless of zoom/pan.
+        let center = camera.screen_to_world(Vec2D::new(640.0, 360.0));
+        let cursor = camera.screen_to_world(self.mouse);
+        canvas.line(center, cursor, 5.0, DARKBLUE);
 
         // The moving rectangle.
         canvas.rectangle(self.x, 520.0, 100.0, 100.0, RED);
         canvas.rectangle(self.player.x, self.player.y, 100.0, 100.0, BLACK);
+        canvas.draw_texture_ex(&self.cow, self.player, 0.0, 6.0, WHITE);
+
+        canvas.end_mode_2d();
     }
 }
 
 fn main() {
     run::<Demo>(Config {
-        width: 1080,
+        width: 1280,
         height: 720,
-        render_width: 1080,
+        render_width: 1280,
         render_height: 720,
         title: "juni — shapes".to_string(),
         target_ups: 60,

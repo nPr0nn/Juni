@@ -24,6 +24,7 @@
 //! window, so your coordinates are resolution-independent.
 
 mod app;
+mod camera;
 mod canvas;
 mod color;
 mod graphics;
@@ -32,17 +33,21 @@ mod math;
 mod renderer;
 mod time;
 
+pub use camera::Camera2D;
 pub use canvas::Canvas;
 pub use color::*;
 pub use input::{Key, MouseButton};
 pub use math::{Rect, Vec2D};
-pub use renderer::Shader;
+pub use renderer::{Shader, Texture};
 
 /// Common imports for using `juni`. `use juni::prelude::*;` brings the engine
 /// entry points, core types, the [`Color`] palette, and input enums into scope.
 pub mod prelude {
     pub use crate::color::*;
-    pub use crate::{run, Canvas, Config, Context, Game, Key, MouseButton, Rect, Shader, Vec2D};
+    pub use crate::{
+        run, Camera2D, Canvas, Config, Context, Game, Key, MouseButton, Rect, Shader, Texture,
+        Vec2D,
+    };
 }
 
 use input::Input;
@@ -134,6 +139,23 @@ impl Context<'_> {
     /// `ctx.load_shader_from_memory(include_str!("my.wgsl"))`.
     pub fn load_shader_from_memory(&self, source: &str) -> Shader {
         self.renderer.build_shader(self.gfx, source)
+    }
+
+    /// Decode PNG `bytes` and upload them as a [`Texture`] (raylib's
+    /// `LoadTextureFromImage` over in-memory data). Pair with `include_bytes!`
+    /// to embed an asset: `ctx.load_texture_from_memory(include_bytes!("a.png"))`.
+    /// A decode failure logs and yields a 1×1 magenta placeholder.
+    pub fn load_texture_from_memory(&self, bytes: &[u8]) -> Texture {
+        self.renderer.build_texture(self.gfx, bytes)
+    }
+
+    /// Load a [`Texture`] from a PNG file on disk (raylib's `LoadTexture`).
+    /// Native only — the web has no synchronous filesystem, so embed assets with
+    /// [`load_texture_from_memory`](Self::load_texture_from_memory) there.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn load_texture(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<Texture> {
+        let bytes = std::fs::read(path)?;
+        Ok(self.renderer.build_texture(self.gfx, &bytes))
     }
 
     /// `true` on the frame `key` was pressed (edge-triggered, ignores OS repeat).
@@ -256,7 +278,9 @@ pub fn run<G: Game>(config: Config) {
 #[cfg(target_arch = "wasm32")]
 fn run_app<G: Game>(event_loop: EventLoop<Graphics>, app: App<G>) {
     std::panic::set_hook(Box::new(console_error_panic_hook::hook));
-    let _ = console_log::init_with_level(log::Level::Error);
+    // Info so juni's own logs (e.g. the per-second FPS readout) reach the
+    // browser console.
+    let _ = console_log::init_with_level(log::Level::Info);
 
     use winit::platform::web::EventLoopExtWebSys;
     event_loop.spawn_app(app);
@@ -264,6 +288,9 @@ fn run_app<G: Game>(event_loop: EventLoop<Graphics>, app: App<G>) {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn run_app<G: Game>(event_loop: EventLoop<Graphics>, mut app: App<G>) {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("error")).init();
+    // Default other crates to `warn` but show juni's own `info` logs (the
+    // per-second FPS readout). `RUST_LOG` still overrides this.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,juni=info"))
+        .init();
     let _ = event_loop.run_app(&mut app);
 }

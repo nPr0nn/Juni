@@ -6,8 +6,10 @@
 //! texture is then blitted onto the swapchain with an aspect-fit (letterboxed)
 //! viewport so the game looks identical at any window size.
 
+use crate::camera::Camera2D;
 use crate::color::{Color, BLACK};
 use crate::graphics::{Graphics, Rc};
+use crate::math::Vec2D;
 use bytemuck::{Pod, Zeroable};
 use glam::Mat4;
 use std::ops::Range;
@@ -33,14 +35,42 @@ macro_rules! shader {
 pub struct Vertex {
     pub position: [f32; 2],
     pub color: [f32; 4],
+    /// Texture coordinates. Ignored by the shape/custom shaders (they only read
+    /// `position` and `color`); used by the texture shader. UV is appended at
+    /// `location(2)` so adding it didn't renumber the existing attributes.
+    pub uv: [f32; 2],
 }
 
 impl Vertex {
     const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
         step_mode: wgpu::VertexStepMode::Vertex,
-        attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x4],
+        attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x4, 2 => Float32x2],
     };
+}
+
+/// A GPU texture ready to draw with [`Canvas::draw_texture`](crate::Canvas::draw_texture)
+/// and friends. Build one from PNG bytes with
+/// [`Context::load_texture_from_memory`](crate::Context::load_texture_from_memory).
+///
+/// Holds an `Rc` to its bind group (texture view + sampler), so cloning is cheap
+/// and the GPU resources live as long as any clone does.
+#[derive(Clone)]
+pub struct Texture {
+    pub(crate) bind_group: Rc<wgpu::BindGroup>,
+    width: u32,
+    height: u32,
+}
+
+impl Texture {
+    /// Width in pixels.
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+    /// Height in pixels.
+    pub fn height(&self) -> u32 {
+        self.height
+    }
 }
 
 /// Per-frame uniforms shared by every shape/custom pipeline (bind group 0).
@@ -68,10 +98,20 @@ pub struct Shader {
     pub(crate) pipeline: Rc<wgpu::RenderPipeline>,
 }
 
-/// A contiguous run of vertices drawn with one pipeline. `None` means the
-/// engine's default shape pipeline; `Some` is a user [`Shader`].
+/// Which pipeline (and resources) a run of vertices draws with.
+#[derive(Clone)]
+enum Pipeline {
+    /// The built-in colored-triangle pipeline.
+    Shape,
+    /// A user [`Shader`] (still a shape-pass pipeline, group 0 only).
+    Custom(Rc<wgpu::RenderPipeline>),
+    /// The texture pipeline, sampling the given bind group (group 1).
+    Texture(Rc<wgpu::BindGroup>),
+}
+
+/// A contiguous run of vertices drawn with one pipeline.
 struct DrawCommand {
-    pipeline: Option<Rc<wgpu::RenderPipeline>>,
+    pipeline: Pipeline,
     range: Range<u32>,
 }
 
@@ -87,8 +127,13 @@ pub struct Batch {
     commands: Vec<DrawCommand>,
     /// First vertex of the run not yet committed to `commands`.
     run_start: u32,
-    /// Pipeline the current run draws with (`None` = default shape pipeline).
-    run_pipeline: Option<Rc<wgpu::RenderPipeline>>,
+    /// Pipeline the current shape/shader run draws with. Texture draws emit
+    /// their own command and leave this untouched (so an active shader mode
+    /// resumes after a texture).
+    run_pipeline: Pipeline,
+    /// Active 2D camera (between `begin/end_mode_2d`). Applied to every vertex
+    /// position on push, so it transforms shapes and textures uniformly.
+    camera: Option<Camera2D>,
 }
 
 impl Batch {
@@ -108,17 +153,61 @@ impl Batch {
         cb: Color,
         cc: Color,
     ) {
-        self.vertices.push(Vertex { position: a, color: ca.to_linear() });
-        self.vertices.push(Vertex { position: b, color: cb.to_linear() });
-        self.vertices.push(Vertex { position: c, color: cc.to_linear() });
+        // Shapes don't sample a texture, so UV is irrelevant (set to 0).
+        self.vertices.push(Vertex { position: self.transform(a), color: ca.to_linear(), uv: [0.0; 2] });
+        self.vertices.push(Vertex { position: self.transform(b), color: cb.to_linear(), uv: [0.0; 2] });
+        self.vertices.push(Vertex { position: self.transform(c), color: cc.to_linear(), uv: [0.0; 2] });
     }
 
-    /// Switch the pipeline used for subsequent geometry, closing the current
-    /// run. `pipeline` is `None` for the default shape pipeline, `Some` for a
-    /// custom [`Shader`].
+    /// Apply the active camera (if any) to a world-space position.
+    fn transform(&self, p: [f32; 2]) -> [f32; 2] {
+        match &self.camera {
+            Some(cam) => cam.world_to_screen(Vec2D::from(p)).to_array(),
+            None => p,
+        }
+    }
+
+    /// Set the active 2D camera (`None` to clear). Used by `begin/end_mode_2d`.
+    pub(crate) fn set_camera(&mut self, camera: Option<Camera2D>) {
+        self.camera = camera;
+    }
+
+    /// Emit a textured quad as its own draw command. `corners` and `uvs` are in
+    /// TL, TR, BR, BL order; `tint` multiplies the sampled texels.
+    pub(crate) fn push_textured_quad(
+        &mut self,
+        corners: [[f32; 2]; 4],
+        uvs: [[f32; 2]; 4],
+        tint: Color,
+        texture: Rc<wgpu::BindGroup>,
+    ) {
+        // Close any pending shape/shader run first so draw order is preserved.
+        self.close_run();
+        let color = tint.to_linear();
+        let start = self.vertices.len() as u32;
+        for &i in &[0usize, 1, 2, 0, 2, 3] {
+            self.vertices.push(Vertex {
+                position: self.transform(corners[i]),
+                color,
+                uv: uvs[i],
+            });
+        }
+        let end = self.vertices.len() as u32;
+        self.commands.push(DrawCommand {
+            pipeline: Pipeline::Texture(texture),
+            range: start..end,
+        });
+        self.run_start = end;
+    }
+
+    /// Switch the pipeline used for subsequent shape geometry, closing the
+    /// current run. Used by `begin/end_shader_mode`.
     pub(crate) fn set_pipeline(&mut self, pipeline: Option<Rc<wgpu::RenderPipeline>>) {
         self.close_run();
-        self.run_pipeline = pipeline;
+        self.run_pipeline = match pipeline {
+            Some(p) => Pipeline::Custom(p),
+            None => Pipeline::Shape,
+        };
     }
 
     /// Commit the in-progress vertex run as a draw command (if non-empty).
@@ -139,7 +228,8 @@ impl Batch {
         self.commands.clear();
         self.clear_color = BLACK;
         self.run_start = 0;
-        self.run_pipeline = None;
+        self.run_pipeline = Pipeline::Shape;
+        self.camera = None;
     }
 }
 
@@ -161,6 +251,11 @@ pub struct Renderer {
     globals_bind_group: wgpu::BindGroup,
     vertex_buffer: wgpu::Buffer,
     vertex_capacity: u64,
+
+    // Texture pass (shares the vertex buffer + globals; group 1 = texture).
+    texture_pipeline: wgpu::RenderPipeline,
+    texture_layout: wgpu::BindGroupLayout,
+    texture_sampler: wgpu::Sampler,
 
     // Kept so `build_shader` can compile user pipelines matching the shape pass.
     globals_layout: wgpu::BindGroupLayout,
@@ -268,6 +363,46 @@ impl Renderer {
             sample_count,
         );
 
+        // --- Texture pipeline (group 0 = globals, group 1 = texture+sampler) ---
+        let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("juni texture layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        // Nearest filtering keeps pixel-art crisp when scaled up (raylib's
+        // default texture filter is also point/nearest).
+        let texture_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("juni texture sampler"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        let texture_shader = shader!(device, "texture");
+        let texture_pipeline = create_textured_pipeline(
+            device,
+            &globals_layout,
+            &texture_layout,
+            &texture_shader,
+            render_format,
+            sample_count,
+        );
+
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("juni vertex buffer"),
             size: INITIAL_VERTEX_CAPACITY * std::mem::size_of::<Vertex>() as u64,
@@ -356,6 +491,9 @@ impl Renderer {
             globals_bind_group,
             vertex_buffer,
             vertex_capacity: INITIAL_VERTEX_CAPACITY,
+            texture_pipeline,
+            texture_layout,
+            texture_sampler,
             globals_layout,
             render_format,
             sample_count,
@@ -366,7 +504,8 @@ impl Renderer {
                 clear_color: BLACK,
                 commands: Vec::new(),
                 run_start: 0,
-                run_pipeline: None,
+                run_pipeline: Pipeline::Shape,
+                camera: None,
             },
         }
     }
@@ -391,6 +530,77 @@ impl Renderer {
         );
         Shader {
             pipeline: Rc::new(pipeline),
+        }
+    }
+
+    /// Decode PNG `bytes` and upload them as a [`Texture`]. On a decode error a
+    /// 1×1 magenta placeholder is returned (and the error logged), matching
+    /// raylib's "never fail the caller" loading ergonomics.
+    pub fn build_texture(&self, gfx: &Graphics, bytes: &[u8]) -> Texture {
+        let (rgba, width, height) = match image::load_from_memory(bytes) {
+            Ok(img) => {
+                let rgba = img.to_rgba8();
+                let (w, h) = rgba.dimensions();
+                (rgba.into_raw(), w, h)
+            }
+            Err(e) => {
+                log::error!("juni: failed to decode texture: {e}");
+                (vec![255, 0, 255, 255], 1, 1)
+            }
+        };
+
+        let size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        let texture = gfx.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("juni texture"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            // sRGB so sampling decodes to linear, matching the shape colors.
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        gfx.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * width),
+                rows_per_image: Some(height),
+            },
+            size,
+        );
+
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = gfx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("juni texture bind group"),
+            layout: &self.texture_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.texture_sampler),
+                },
+            ],
+        });
+
+        Texture {
+            bind_group: Rc::new(bind_group),
+            width,
+            height,
         }
     }
 
@@ -452,11 +662,18 @@ impl Renderer {
             if !self.batch.commands.is_empty() {
                 pass.set_bind_group(0, &self.globals_bind_group, &[]);
                 pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-                // One draw per run; the pipeline switches at each
-                // begin/end_shader_mode boundary.
+                // One draw per run, in submission order so layering is correct.
+                // The pipeline (and, for textures, the group-1 binding) switches
+                // at each begin/end_shader_mode or texture boundary.
                 for cmd in &self.batch.commands {
-                    let pipeline = cmd.pipeline.as_deref().unwrap_or(&self.shape_pipeline);
-                    pass.set_pipeline(pipeline);
+                    match &cmd.pipeline {
+                        Pipeline::Shape => pass.set_pipeline(&self.shape_pipeline),
+                        Pipeline::Custom(p) => pass.set_pipeline(p),
+                        Pipeline::Texture(tex) => {
+                            pass.set_pipeline(&self.texture_pipeline);
+                            pass.set_bind_group(1, tex.as_ref(), &[]);
+                        }
+                    }
                     pass.draw(cmd.range.clone(), 0..1);
                 }
             }
@@ -555,6 +772,53 @@ fn create_shape_pipeline(
     });
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("juni shape pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            buffers: &[Vertex::LAYOUT],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: render_format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: Default::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState {
+            count: sample_count,
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        },
+        multiview: None,
+        cache: None,
+    })
+}
+
+/// Like [`create_shape_pipeline`] but with a second bind group for the texture
+/// (group 1). Shares the same `Vertex` layout — the texture shader additionally
+/// reads `uv` (location 2).
+fn create_textured_pipeline(
+    device: &wgpu::Device,
+    globals_layout: &wgpu::BindGroupLayout,
+    texture_layout: &wgpu::BindGroupLayout,
+    shader: &wgpu::ShaderModule,
+    render_format: wgpu::TextureFormat,
+    sample_count: u32,
+) -> wgpu::RenderPipeline {
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("juni texture pipeline layout"),
+        bind_group_layouts: &[globals_layout, texture_layout],
+        push_constant_ranges: &[],
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("juni texture pipeline"),
         layout: Some(&layout),
         vertex: wgpu::VertexState {
             module: shader,

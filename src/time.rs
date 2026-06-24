@@ -24,8 +24,6 @@ pub struct TimeStep {
     fps: u32,
     frame_counter: u32,
     fps_timer: f32,
-    /// DIAG: worst (longest) frame time seen in the current 1s window.
-    worst_frame: f32,
 }
 
 impl TimeStep {
@@ -42,7 +40,6 @@ impl TimeStep {
             fps: 0,
             frame_counter: 0,
             fps_timer: 0.0,
-            worst_frame: 0.0,
         }
     }
 
@@ -70,17 +67,17 @@ impl TimeStep {
         let frame_time = frame_time_raw.min(self.max_frame_time);
         self.accumulator += frame_time;
 
-        // FPS sampling.
+        // FPS sampling, once per real second.
         self.frame_counter += 1;
         self.fps_timer += frame_time;
-        if frame_time_raw > self.worst_frame {
-            self.worst_frame = frame_time_raw;
-        }
         if self.fps_timer >= 1.0 {
             self.fps = self.frame_counter;
+            // `log::info!` reaches both the native logger and the browser
+            // console (via console_log), unlike `println!` which is silent on
+            // the web.
+            log::info!("juni fps={}", self.fps);
             self.frame_counter = 0;
             self.fps_timer = 0.0;
-            self.worst_frame = 0.0;
         }
 
         frame_time

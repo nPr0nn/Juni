@@ -2,10 +2,11 @@
 //! current frame's batch; all shapes are decomposed into triangles. Coordinates
 //! are in virtual-canvas pixels (origin top-left, +Y down).
 
+use crate::camera::Camera2D;
 use crate::color::Color;
 use crate::math::{Rect, Vec2D};
 use crate::renderer::Batch;
-use crate::Shader;
+use crate::{Shader, Texture};
 
 pub struct Canvas<'a> {
     batch: &'a mut Batch,
@@ -34,6 +35,18 @@ impl<'a> Canvas<'a> {
     /// [`begin_shader_mode`](Self::begin_shader_mode).
     pub fn end_shader_mode(&mut self) {
         self.batch.set_pipeline(None);
+    }
+
+    /// Draw subsequent shapes/textures through `camera` (world space) until
+    /// [`end_mode_2d`](Self::end_mode_2d). Raylib's `BeginMode2D`.
+    pub fn begin_mode_2d(&mut self, camera: Camera2D) {
+        self.batch.set_camera(Some(camera));
+    }
+
+    /// Stop applying the 2D camera; subsequent drawing is back in screen space.
+    /// Raylib's `EndMode2D`.
+    pub fn end_mode_2d(&mut self) {
+        self.batch.set_camera(None);
     }
 
     /// Draw a filled, axis-aligned rectangle.
@@ -126,5 +139,73 @@ impl<'a> Canvas<'a> {
     pub fn circle(&mut self, center: Vec2D, radius: f32, color: Color) {
         let segments = ((radius * 0.6) as u32).clamp(12, 64);
         self.regular_polygon(center, segments, radius, 0.0, color);
+    }
+
+    /// Draw `texture` at native size with its top-left at `(x, y)`. `tint`
+    /// multiplies the texels (use [`WHITE`](crate::WHITE) for no tint).
+    /// Raylib's `DrawTexture`.
+    pub fn draw_texture(&mut self, texture: &Texture, x: f32, y: f32, tint: Color) {
+        self.draw_texture_v(texture, Vec2D::new(x, y), tint);
+    }
+
+    /// Draw `texture` at native size with its top-left at `position`. Raylib's
+    /// `DrawTextureV`.
+    pub fn draw_texture_v(&mut self, texture: &Texture, position: Vec2D, tint: Color) {
+        let (w, h) = (texture.width() as f32, texture.height() as f32);
+        let src = Rect::new(0.0, 0.0, w, h);
+        let dest = Rect::new(position.x, position.y, w, h);
+        self.draw_texture_pro(texture, src, dest, Vec2D::ZERO, 0.0, tint);
+    }
+
+    /// Draw `texture` with a uniform `scale` and `rotation` (degrees, around
+    /// `position`). Raylib's `DrawTextureEx`.
+    pub fn draw_texture_ex(
+        &mut self,
+        texture: &Texture,
+        position: Vec2D,
+        rotation: f32,
+        scale: f32,
+        tint: Color,
+    ) {
+        let (w, h) = (texture.width() as f32, texture.height() as f32);
+        let src = Rect::new(0.0, 0.0, w, h);
+        let dest = Rect::new(position.x, position.y, w * scale, h * scale);
+        self.draw_texture_pro(texture, src, dest, Vec2D::ZERO, rotation, tint);
+    }
+
+    /// The general texture draw (raylib's `DrawTexturePro`): sample the `source`
+    /// sub-rectangle (in texture pixels) into the `dest` rectangle (in canvas
+    /// pixels), pivoting/rotating about `origin` (an offset within `dest`, also
+    /// the point placed at `dest`'s position). `rotation` is in degrees.
+    pub fn draw_texture_pro(
+        &mut self,
+        texture: &Texture,
+        source: Rect,
+        dest: Rect,
+        origin: Vec2D,
+        rotation: f32,
+        tint: Color,
+    ) {
+        let (tw, th) = (texture.width() as f32, texture.height() as f32);
+        // Source pixels -> UVs, in TL, TR, BR, BL order.
+        let (u0, v0) = (source.x / tw, source.y / th);
+        let (u1, v1) = ((source.x + source.width) / tw, (source.y + source.height) / th);
+        let uvs = [[u0, v0], [u1, v0], [u1, v1], [u0, v1]];
+
+        // Corners relative to the origin pivot, rotated, then placed at dest.
+        let (sin, cos) = rotation.to_radians().sin_cos();
+        let (dx, dy) = (-origin.x, -origin.y);
+        let local = [
+            [dx, dy],
+            [dx + dest.width, dy],
+            [dx + dest.width, dy + dest.height],
+            [dx, dy + dest.height],
+        ];
+        let corners = local.map(|[lx, ly]| {
+            [dest.x + lx * cos - ly * sin, dest.y + lx * sin + ly * cos]
+        });
+
+        self.batch
+            .push_textured_quad(corners, uvs, tint, texture.bind_group.clone());
     }
 }
